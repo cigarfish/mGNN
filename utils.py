@@ -13,8 +13,6 @@ import numpy as np
 import torch
 import pandas as pd
 
-from dataset import GraphDataset
-
 def compute_gene2pathway_dist(g, max_hops=3,):
     """
     Compute min-hop distance from each gene to each reachable pathway.
