@@ -2,6 +2,7 @@
 
 import utils
 import torch
+import numpy as np
 from collections import defaultdict
 
 def main():
@@ -17,7 +18,7 @@ def main():
             pathway_gene_file,
             pathway_relations_file)
 
-    gene2pathway_dist = g.graph_data['gene2pathway_dist']
+    gene2pathway_dist = g.graph_data['gene2pathway_dist'] # for each gene, the distance from it to all pathways (through gene-gene interaction)
     id2gene = {v: k for k, v in gene2id.items()}
     id2pathway = {v: k for k, v in pathway2id.items()}
 
@@ -76,6 +77,26 @@ def main():
     # gene -> pathway edges should match pathway -> gene
     gp_edges = g.num_edges(('gene', 'in_pathway', 'pathway'))
     pg_edges = g.num_edges(('pathway', 'has_gene', 'gene'))
+    src, dst = g.edges(etype=('gene', 'in_pathway', 'pathway'))
+    take_mask = g.nodes['pathway'].data['take_mask']
+    valid_mask = take_mask[dst]
+    src = src[valid_mask]
+    dst = dst[valid_mask]
+    gene_pathway_deg = torch.bincount(
+            src,
+            minlength=g.num_nodes('gene')
+    ).cpu().numpy()
+    print("Mean pathways per gene:", gene_pathway_deg.mean())
+    print("Max pathways per gene:", gene_pathway_deg.max())
+    bins = [0,1,2,3,4,5,6,7,8,9,10]
+    hist = {}
+    for b in bins:
+        hist[b] = np.sum(gene_pathway_deg == b)
+    hist["10+"] = np.sum(gene_pathway_deg > 10)
+    print("\nGene -> pathway count histogram")
+    for k,v in hist.items():
+        print(f"{k}: {v}")
+
     print(f"gene→pathway edges: {gp_edges}")
     print(f"pathway→gene edges: {pg_edges}")
     assert gp_edges == pg_edges, "Mismatch in gene-pathway edge counts!"

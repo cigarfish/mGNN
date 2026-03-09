@@ -49,10 +49,10 @@ class PathwayNegativeSampler:
     """
     def __init__(
         self,
-        gene2pathway_dist,
-        take_mask,
+        g,
         num_pathways,
         max_reach_dist=2,
+        max_motifs_per_pathway=20
     ):
         """
         Parameters
@@ -69,17 +69,202 @@ class PathwayNegativeSampler:
         max_reach_dist : int
             Pathways within this distance are NOT allowed as negatives
         """
-        self.gene2pathway_dist = gene2pathway_dist
-        self.take_mask = take_mask
+        self.g = g
         self.num_pathways = num_pathways
         self.max_reach_dist = max_reach_dist
+        self.max_motifs_per_pathway = max_motifs_per_pathway
+        
+        # Build neighbors only within particular pathway
+        self.pathway_gene_neighbors = defaultdict(lambda: defaultdict(list))
+        self.gene2direct_pathways = defaultdict(set)
 
+        pathway_mask = g.edges['ppi'].data['pathway_mask']
+        take_mask = g.nodes['pathway'].data['take_mask']
+        src, dst = g.edges(etype='ppi')
+
+        for eid in range(g.num_edges('ppi')):
+            s = src[eid].item()
+            d = dst[eid].item()
+            # pathways this edge belongs to
+            pws = torch.where(pathway_mask[eid])[0]
+            for pw in pws:
+                pw = pw.item()
+                # skip pathways not taken
+                if not take_mask[pw]:
+                    continue
+
+                self.pathway_gene_neighbors[pw][s].append(d)
+                self.pathway_gene_neighbors[pw][d].append(s)
+
+                self.gene2direct_pathways[s].add(pw)
+                self.gene2direct_pathways[d].add(pw)
+
+        # pathway genes in string PPI
+        self.pathway_ppi_genes = {
+                p: list(neigh.keys())
+                for p, neigh in self.pathway_gene_neighbors.items()
+        }
         # Precompute valid pathway pool
-        self.valid_pathways = torch.where(take_mask)[0]
+        #self.valid_pathways = torch.where(take_mask)[0]
 
     # --------------------------------------------------
     # Core logic
     # --------------------------------------------------
+    def _genes_in_pathway(self, p):
+        return self.g.predecessors(p, etype='in_pathway').tolist()
+
+    def _gene_neighbors(self, gene_id, pathway_id):
+        return self.pathway_gene_neighbors[pathway_id].get(gene_id, [])
+
+    def _sample_motif(self, pathway_id, start_gene=None):
+        #genes = self._genes_in_pathway(pathway_id)
+        #genes = list(self.pathway_gene_neighbors[pathway_id].keys())
+        genes = self.pathway_ppi_genes.get(pathway_id, [])
+
+        if len(genes) < 3:
+            return None
+
+        if start_gene is not None:
+            if start_gene not in self.pathway_gene_neighbors[pathway_id]:
+                return None
+            g0 = start_gene
+        else:
+            g0 = random.choice(genes)
+
+        nbr1 = [g for g in self._gene_neighbors(g0, pathway_id) if g != g0]
+        if not nbr1:
+            return None
+
+        g1 = random.choice(nbr1)
+
+        nbr2 = [g for g in self._gene_neighbors(g1, pathway_id) if g!= g0 and g!= g1]
+        if not nbr2:
+            return None
+
+        g2 = random.choice(nbr2)
+
+        return (pathway_id, g0, g1, g2)
+
+    def _sample_pathway_jump(self, gene_id, current_pathway):
+        # pathways containing this gene
+        pathways = self.gene2direct_pathways.get(gene_id, set())
+
+        candidates = [
+                pw for pw in pathways
+                if pw != current_pathway #and self.take_mask[pw]
+        ]
+
+        if not candidates:
+            return None
+
+        return random.choice(candidates)
+
+    def _sample_pathways_jump(self, gene_id, current_pathway, k=3):
+        pathways = self.gene2direct_pathways.get(gene_id, set())
+
+        candidates = [
+                pw for pw in pathways
+                if pw != current_pathway
+        ]
+
+        if not candidates:
+            return []
+
+        if len(candidates) <= k:
+            return candidates
+
+        return random.sample(candidates, k)
+
+    def _positive_sample(self, ctx, max_genes_per_pathway=20):
+        gg_pairs = set()
+        gp_pairs = set()
+        pg_pairs = set()
+
+        for p1 in random.sample(list(ctx.pathways), len(ctx.pathways)):
+
+            sampled_genes = set()
+
+            trials = 0
+            max_trials = 100
+            motif_count = 0
+
+            while (
+                len(sampled_genes) < max_genes_per_pathway 
+                and trials < max_trials
+                and motif_count < self.max_motifs_per_pathway
+            ):
+
+                trials += 1
+
+                motif = self._sample_motif(p1, start_gene=None)
+                if motif is None:
+                    continue
+
+                _, g0, g1, g2 = motif
+
+                sampled_genes.update([g0, g1, g2])
+
+                # gene-gene
+                gg_pairs.add(tuple(sorted((g0, g1))))
+                gg_pairs.add(tuple(sorted((g1, g2))))
+
+                # gene-pathway
+                gp_pairs.update([
+                    (g0, p1),
+                    (g1, p1),
+                    (g2, p1)
+                ])
+
+                # pathway-gene
+                pg_pairs.update([
+                    (p1, g0),
+                    (p1, g1),
+                    (p1, g2)
+                ])
+
+                # pathway jump
+                p2 = self._sample_pathway_jump(g2, p1)
+
+                if p2 is None:
+                    continue
+
+                motif2 = self._sample_motif(p2, start_gene=g2)
+
+                if motif2 is None:
+                    continue
+
+                _, g2, g3, g4 = motif2
+
+                gg_pairs.add(tuple(sorted((g2, g3))))
+                gg_pairs.add(tuple(sorted((g3, g4))))
+
+                gp_pairs.update([
+                    (g2, p2),
+                    (g3, p2),
+                    (g4, p2)
+                ])
+
+                pg_pairs.update([
+                    (p2, g2),
+                    (p2, g3),
+                    (p2, g4)
+                ])
+
+                motif_count += 1
+
+            for g in sampled_genes:
+                jump_pathways = self._sample_pathways_jump(g, p1, k=3)
+
+                for p2 in jump_pathways:
+                    gp_pairs.add((g, p2))
+                    pg_pairs.add((p2, g))
+
+        return {
+            "gg": list(gg_pairs),
+            "gp": list(gp_pairs),
+            "pg": list(pg_pairs)
+        }
+
 
     def reachable_pathways(self, gene_id: int):
         """
