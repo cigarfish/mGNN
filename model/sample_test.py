@@ -265,6 +265,7 @@ class PathwayNegativeSampler:
             "pg": list(pg_pairs)
         }
 
+    def _negative_sample(self, ):
 
     def reachable_pathways(self, gene_id: int):
         """

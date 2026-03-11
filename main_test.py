@@ -22,6 +22,34 @@ def main():
     id2gene = {v: k for k, v in gene2id.items()}
     id2pathway = {v: k for k, v in pathway2id.items()}
 
+    # loading enrichment files
+    contexts = utils.load_all_geo_contexts(
+        "data/enrichment",
+        g,
+        pathway2id,
+        gene2id
+    )
+
+    print(f"\nLoaded {len(contexts)} GEO enrichment contexts\n")
+    
+    for ctx in contexts:
+        print(f"GEO dataset: {ctx.geo_id}")
+        print(f"Number of enriched pathways: {len(ctx.pathway_genes)}")
+        for pid, info in ctx.pathway_genes.items():
+            pname = id2pathway.get(pid, "UNKNOWN")
+            parent = info["parent"]
+            genes = info["genes"]
+            gene_symbols = [id2gene[g] for g in list(genes)[:10]] # show first 10
+            print(
+                f"    parent={parent} -> "
+                f"pathway_id={pid} "
+                f"pathway_name={pname} "
+                f"num_genes={len(genes)} "
+                f"sample_genes={gene_symbols}"
+            )
+
+        print("-" * 60)
+
     # -----------------------------
     # Basic graph info
     # -----------------------------

@@ -6,12 +6,25 @@ import json
 import math
 import multiprocessing
 import random
+import csv
+import os
+import glob
 
 import dgl
 import networkx as nx
 import numpy as np
 import torch
 import pandas as pd
+
+# class for GEO enrichment analysis file
+class GEOContext:
+    def __init__(self, geo_id, pathway_genes):
+        self.geo_id = geo_id                  # GEO id
+        self.pathway_genes = pathway_genes    # TAKE pathway ids
+
+    @property
+    def pathways(self):
+        return list(self.pathway_genes.keys())
 
 def compute_gene2pathway_dist(g, max_hops=3,):
     """
@@ -77,6 +90,43 @@ def compute_gene2pathway_dist(g, max_hops=3,):
 
     return gene2pathway_dist
 
+def get_leaf_descendants(g, pathway_id):
+    """
+    Return all TAKE leaf descendants of a given pathway
+    """
+    take_mask = g.nodes['pathway'].data['take_mask']
+
+    visited = set()
+    stack = [pathway_id]
+
+    leaf_nodes = []
+
+    while stack:
+        p = stack.pop()
+        if p in visited:
+            continue
+        visited.add(p)
+
+        # find children
+        children = g.successors(p, etype='parent_of').tolist()
+        if len(children) == 0:
+            # leaf node
+            if take_mask[p]:
+                leaf_nodes.append(p)
+        else:
+            stack.extend(children)
+
+    return leaf_nodes
+
+def build_leaf_descendant_cache(g):
+    cache = {}
+
+    num_pathways = g.num_nodes('pathway')
+
+    for p in range(num_pathways):
+        cache[p] = get_leaf_descendants(g,p)
+
+    return cache
 
 # load the reactome hierarchical pathways
 def load_reactome_mux_graph(ppi_file, pathway_gene_file, pathway_rel_file):
@@ -108,6 +158,10 @@ def load_reactome_mux_graph(ppi_file, pathway_gene_file, pathway_rel_file):
         pathway_ids_from_genes.update(pathways)
     all_pathways = pathway_ids_from_rel.union(pathway_ids_from_genes)
     pathway2id = {pathway: idx for idx, pathway in enumerate(sorted(all_pathways))}
+
+    # the inverse mappings
+    id2gene = {v: k for k, v in gene2id.items()}
+    id2pathway = {v: k for k, v in pathway2id.items()}
 
     num_genes = len(gene2id)
     num_pathways = len(pathway2id)
@@ -183,5 +237,165 @@ def load_reactome_mux_graph(ppi_file, pathway_gene_file, pathway_rel_file):
     g.graph_data = {}
     g.graph_data['gene2pathway_dist'] = gene2pathway_dist
 
+    # store pathway's chidren
+    g.graph_data['leaf_descendants'] = build_leaf_descendant_cache(g)
+
+    # store pathway genes
+    g.graph_data['pathway_genes'] = {
+        pw: set(g.successors(pw, etype='has_gene').tolist())
+        for pw in range(g.num_nodes('pathway'))
+    }
+
+    # add the two id maps
+    g.graph_data['id2pathway'] = id2pathway
+    g.graph_data['id2gene'] = id2gene
+
     # Return the graph and the gene/pathway ID mappings
     return g, gene2id, pathway2id
+
+def load_geo_enrichment(enrichment_file, g, pathway2id, gene2id, padj_cutoff=0.05):
+
+    geo_id = os.path.basename(enrichment_file).split("_")[0]
+
+    pathway_genes = defaultdict(set)
+
+    with open(enrichment_file) as f:
+        
+        reader = csv.DictReader(f)
+
+        for row in reader:
+            padj = float(row["p.adjust"])
+
+            if padj > padj_cutoff:
+                continue
+            
+            parent_pathway_name = row["ID"]
+
+            if parent_pathway_name not in pathway2id:
+                continue
+
+            parent_pathway = pathway2id[parent_pathway_name]
+
+            # -------------------
+            # read enriched genes
+            # -------------------
+            gene_symbols = row["gene_symbols"].split(",")
+
+            genes = set()
+
+            for gsym in gene_symbols:
+                gsym = gsym.strip()
+                if gsym in gene2id:
+                    gid = gene2id[gsym]
+                    genes.add(gid)
+                    #enriched_genes.add(gid)
+
+            if not genes:
+                continue
+
+            # ------------------------
+            # project to TAKE pathways
+            # ------------------------
+            leaf_pathways = project_to_take_pathways(g, parent_pathway, genes)
+
+            for pw, overlap in leaf_pathways:
+                if pw not in pathway_genes:
+                    pathway_genes[pw] = {
+                        "parent": parent_pathway_name,
+                        "genes": set()
+                    }
+
+                pathway_genes[pw]["genes"].update(overlap)
+
+    if not pathway_genes:
+        return None
+
+    ctx = GEOContext(
+        geo_id = geo_id,
+        pathway_genes = dict(pathway_genes)
+    )
+
+    return ctx
+
+def load_all_geo_contexts(enrichment_dir, g, pathway2id, gene2id, padj_cutoff=0.05, top_k=None):
+
+    contexts = []
+
+    files = glob.glob(f"{enrichment_dir}/*_Reactome_enrichment_full.csv")
+
+    for f in files:
+        ctx = load_geo_enrichment(f, g, pathway2id, gene2id, padj_cutoff=padj_cutoff)
+
+        if len(ctx.pathway_genes) == 0:
+            continue
+
+        contexts.append(ctx)
+
+    return contexts
+
+def project_to_take_pathways(g, parent_pathway, genes, ratio_threshold=0.6):
+
+    leaf_cache = g.graph_data['leaf_descendants']
+
+    leaf_pathways = leaf_cache.get(parent_pathway, [])
+
+    if not leaf_pathways:
+        leaf_pathways = [parent_pathway]
+
+    scores = []
+
+    for pw in leaf_pathways:
+        # gene in this pathway
+        pw_genes = g.graph_data['pathway_genes'][pw]
+
+        if not pw_genes:
+            continue
+
+        overlap = genes & pw_genes
+
+        if not overlap:
+            continue
+
+        overlap_ratio = len(overlap) / len(pw_genes)
+
+        dice = 2 * len(overlap) / (len(genes) + len(pw_genes))
+
+        geom = len(overlap) / (len(genes) * len(pw_genes)) ** 0.5
+
+        jaccard = overlap_ratio * math.log1p(len(overlap))
+
+        #scores.append((pw, overlap_ratio, overlap))
+        scores.append((pw, geom, overlap))
+
+    if not scores:
+        return []
+
+    scores.sort(key=lambda x: x[1], reverse=True)
+
+    # Debug for monitoring scores
+    #parent_name = g.graph_data['id2pathway'][parent_pathway]
+    #print(f"\n[Pathway projection debug]")
+    #print(f"Parent pathway: {parent_name} (id={parent_pathway})")
+    #print("Candidate leaf pathways:")
+
+    best_score = scores[0][1]
+
+    selected = []
+
+    for pw, score, overlap in scores:
+        #pw_name = g.graph_data['id2pathway'][pw]
+        #print(
+        #    f"    child={pw_name} (id={pw}) "
+        #    f"score={score:.3f} "
+        #    f"overlap={len(overlap)}"
+        #)
+        if score >= best_score * ratio_threshold:
+            selected.append((pw, overlap))
+            #print(f" take this pathway")
+        else:
+            break
+            #print(f" not to take this pathway")
+
+    return selected
+
+
