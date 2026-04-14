@@ -1,46 +1,18 @@
 #!/usr/bin/env python3
 
 import math
+import random
 
 import torch
 from torch import nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
+from collections import defaultdict
+
 import dgl
 from dgl.dataloading import Collator, BlockSampler
 # noinspection PyProtectedMember
-from dgl.dataloading.pytorch import _pop_blocks_storage, _restore_blocks_storage
-
-class PathwayContext:
-    """
-    Represents one GEO dataset (or one biological condition).
-    """
-    def __init__(self, pathway_ids):
-        """
-        Parameters
-        ----------
-        pathway_ids : Iterable[int]
-            Enriched pathway node IDs for this GEO dataset
-        """
-        self.pathways = set(pathway_ids)
-
-    def contains(self, pathway_id: int) -> bool:
-        return pathway_id in self.pathways
-
-class GeoBatchContext:
-    """
-    A batch of GEO datasets.
-    """
-
-    def __init__(self, contexts):
-        """
-        contexts : List[PathwayContext]
-        """
-        self.contexts = contexts
-
-    def __len__(self):
-        return len(self.contexts)
 
 class PathwayNegativeSampler:
     """
@@ -50,7 +22,6 @@ class PathwayNegativeSampler:
     def __init__(
         self,
         g,
-        num_pathways,
         max_reach_dist=2,
         max_motifs_per_pathway=20
     ):
@@ -70,7 +41,6 @@ class PathwayNegativeSampler:
             Pathways within this distance are NOT allowed as negatives
         """
         self.g = g
-        self.num_pathways = num_pathways
         self.max_reach_dist = max_reach_dist
         self.max_motifs_per_pathway = max_motifs_per_pathway
         
@@ -82,9 +52,11 @@ class PathwayNegativeSampler:
         take_mask = g.nodes['pathway'].data['take_mask']
         src, dst = g.edges(etype='ppi')
 
+        self.ppi_edges = set()
         for eid in range(g.num_edges('ppi')):
             s = src[eid].item()
             d = dst[eid].item()
+            self.ppi_edges.add(tuple(sorted((s,d))))
             # pathways this edge belongs to
             pws = torch.where(pathway_mask[eid])[0]
             for pw in pws:
@@ -101,11 +73,22 @@ class PathwayNegativeSampler:
 
         # pathway genes in string PPI
         self.pathway_ppi_genes = {
-                p: list(neigh.keys())
-                for p, neigh in self.pathway_gene_neighbors.items()
+            p: list(neigh.keys())
+            for p, neigh in self.pathway_gene_neighbors.items()
         }
-        # Precompute valid pathway pool
-        #self.valid_pathways = torch.where(take_mask)[0]
+        # degree of each gene
+        self.gene_degree = defaultdict(int)
+        for g1, g2 in zip(src.tolist(), dst.tolist()):
+            edge = tuple(sorted((g1, g2)))
+            self.gene_degree[g1] += 1
+            self.gene_degree[g2] += 1
+        self.all_genes = list(range(self.g.num_nodes('gene')))
+        
+        # build degree bins
+        self.degree_bins = defaultdict(list)
+        for g0, deg in self.gene_degree.items():
+            bin_id = int(math.log2(deg + 1))
+            self.degree_bins[bin_id].append(g0)
 
     # --------------------------------------------------
     # Core logic
@@ -175,18 +158,27 @@ class PathwayNegativeSampler:
 
         return random.sample(candidates, k)
 
-    def _positive_sample(self, ctx, max_genes_per_pathway=20):
+    def sample_pos_neg(self, ctx, max_genes_per_pathway=20, neg_multiplier=5):
+        # ----------------
+        # Positive samples
+        # ----------------
         gg_pairs = set()
         gp_pairs = set()
         pg_pairs = set()
 
-        for p1 in random.sample(list(ctx.pathways), len(ctx.pathways)):
+        for p1, pdata in random.sample(list(ctx.pathway_genes.items()), len(ctx.pathway_genes)):
 
-            sampled_genes = set()
+            enriched_genes = list(pdata["genes"])
+            pathway_genes = self.pathway_ppi_genes.get(p1, [])
+            non_enriched_genes = [g for g in pathway_genes if g not in enriched_genes]
+
+            if len(enriched_genes) == 0:
+                continue
 
             trials = 0
             max_trials = 100
             motif_count = 0
+            sampled_genes = set()
 
             while (
                 len(sampled_genes) < max_genes_per_pathway 
@@ -196,11 +188,25 @@ class PathwayNegativeSampler:
 
                 trials += 1
 
-                motif = self._sample_motif(p1, start_gene=None)
-                if motif is None:
+                # prioritize enriched genes
+                if random.random() < 0.8 or not non_enriched_genes:
+                    g0 = random.choice(enriched_genes)
+                else:
+                    g0 = random.choice(non_enriched_genes)
+
+                nbr1 = [g for g in self._gene_neighbors(g0, p1) if g != g0]
+
+                if not nbr1:
                     continue
 
-                _, g0, g1, g2 = motif
+                g1 = random.choice(nbr1)
+
+                nbr2 = [g for g in self._gene_neighbors(g1, p1) if g != g0 and g != g1]
+
+                if not nbr2:
+                    continue
+
+                g2 = random.choice(nbr2)
 
                 sampled_genes.update([g0, g1, g2])
 
@@ -228,12 +234,21 @@ class PathwayNegativeSampler:
                 if p2 is None:
                     continue
 
-                motif2 = self._sample_motif(p2, start_gene=g2)
+                nbr3 = [g for g in self._gene_neighbors(g2, p2) if g != g2]
 
-                if motif2 is None:
+                if not nbr3:
                     continue
 
-                _, g2, g3, g4 = motif2
+                g3 = random.choice(nbr3)
+
+                nbr4 = [g for g in self._gene_neighbors(g3, p2) if g != g2 and g != g3]
+
+                if not nbr4:
+                    continue
+
+                g4 = random.choice(nbr4)
+
+                motif2 = self._sample_motif(p2, start_gene=g2)
 
                 gg_pairs.add(tuple(sorted((g2, g3))))
                 gg_pairs.add(tuple(sorted((g3, g4))))
@@ -259,244 +274,79 @@ class PathwayNegativeSampler:
                     gp_pairs.add((g, p2))
                     pg_pairs.add((p2, g))
 
-        return {
-            "gg": list(gg_pairs),
-            "gp": list(gp_pairs),
-            "pg": list(pg_pairs)
-        }
+        # ---------------
+        # Negative sample
+        # ---------------
+        # for gene-gene pairs
+        pos_gg_count = len(gg_pairs)
+        neg_gg = set()
 
-    def _negative_sample(self, ):
+        for g1, g2 in gg_pairs:
 
-    def reachable_pathways(self, gene_id: int):
-        """
-        Pathways biologically reachable from gene.
-        """
-        dist_map = self.gene2pathway_dist.get(gene_id, {})
-        return {
-            p for p, d in dist_map.items()
-            if d <= self.max_reach_dist
-        }
+            anchor = g1 if random.random() < 0.5 else g2
 
-    def sample_negatives(
-        self,
-        gene_ids,
-        pathway_context: PathwayContext,
-        num_neg:int,
-        device,
-    ):
-        """
-        Sample negative pathways for each gene.
-
-        Returns
-        -------
-        neg_pathways : LongTensor [B, num_neg]
-        """
-        B = len(gene_ids)
-        neg_samples = []
-
-        for g in gene_ids.tolist():
-            forbidden = set()
-
-            # 1) GEO-enriched pathways
-            forbidden |= pathway_context.pathways
-
-            # 2) Biologically reachable pathways
-            forbidden |= self.reachable_pathways(g)
-
-            # 3) Invalid (non-leaf) already filtered by valid_pathways
-
-            candidates = [
-                p.item()
-                for p in self.valid_pathways
-                if p.item() not in forbidden
-            ]
-
-            if len(candidates) == 0:
-                raise RuntimeError(
-                    f"No valid negatives for gene {g}"
+            deg = self.gene_degree.get(anchor, 1)
+            bin_id = int(math.log2(deg + 1))
+            candidates = self.degree_bins.get(bin_id)
+            if not candidates:
+                candidates = (
+                    self.degree_bins.get(bin_id-1)
+                    or self.degree_bins.get(bin_id+1)
+                    or self.all_genes
                 )
 
-            sampled = torch.randint(
-                0, len(candidates),
-                (num_neg,),
-                device=device
-            )
-            neg_samples.append(
-                torch.tensor(
-                    [candidates[i] for i in sampled],
-                    device=device
-                )
-            )
+            sampled = 0
+            trials = 0
+            max_trials = 100
 
-        return torch.stack(neg_samples, dim=0)
+            anchor_pathways = self.gene2direct_pathways.get(anchor, set())
 
+            while sampled < 2 and trials < max_trials:
+                trials += 1
+                g_neg = random.choice(candidates)
 
-class PathwayNegativeSamplingLoss(nn.Module):
-    def __init__(
-        self,
-        num_genes: int,
-        num_pathways: int,
-        embed_dim: int,
-        num_neg: int=10
-    ):
-        super().__init__()
+                if g_neg == anchor:
+                    continue
 
-        self.num_genes = num_genes
-        self.num_pathways = num_pathways
-        self.embed_dim = embed_dim
-        self.num_neg = num_neg
+                edge = tuple(sorted((anchor, g_neg)))
 
-        self.gene_weights = nn.Parameter(torch.empty(num_genes, embed_dim))
-        self.pathway_weights = nn.Parameter(torch.empty(num_pathways, embed_dim))
+                # skip real PPI edges
+                if edge in self.ppi_edges:
+                    continue
 
-        self.reset_parameters()
+                # avoid same pathway genes
+                if len(anchor_pathways.intersection(self.gene2direct_pathways.get(g_neg, set()))) > 0:
+                    continue
 
-    def reset_parameters(self):
-        nn.init.normal_(self.gene_weights, std=1.0 / math.sqrt(self.embed_dim))
-        nn.init.normal_(self.pathway_weights, std=1.0 / math.sqrt(self.embed_dim))
+                neg_gg.add(edge)
+                sampled += 1
 
-    # --------------------------------------------------
-    # Sampling helpers
-    # --------------------------------------------------
-    def _sample_gene_neg(self, B, device):
-        return torch.randint(0, self.num_genes, (B, self.num_neg), device=device)
+        # for gene-pathway pairs
+        pos_gp_count = len(gp_pairs)
+        neg_target = pos_gp_count * neg_multiplier
+        neg_gp = set()
+        neg_pg = set()
+        num_pathways = self.g.num_nodes('pathway')
+        all_pathways = list(range(num_pathways))
 
-    def _sample_pathway_neg(self, B, device):
-        return torch.randint(0, self.num_pathways, (B, self.num_neg), device=device)
+        while len(neg_gp) < neg_target:
+            g = random.choice(list(self.gene2direct_pathways.keys()))
+            p = random.choice(all_pathways)
+            # skip if gene already belongs to pathway or pathway not TAKE
+            if p in self.gene2direct_pathways[g]:
+                continue
+            if not self.g.nodes['pathway'].data['take_mask'][p]:
+                continue
 
-    # --------------------------------------------------
-    # Atomic losses
-    # --------------------------------------------------
-    def _gene_gene(self, src, ctx, gene_embeds):
-        h = gene_embeds[src]
-        w = self.gene_weights[ctx]
+            neg_gp.add((g, p))
+            neg_pg.add((p, g))
 
-        pos = F.logsigmoid(torch.sum(h * w, dim=1))
-
-        neg_ids = self._sample_gene_neg(len(src), h.device)
-        neg_w = self.gene_weights[neg_ids]
-
-        neg = F.logsigmoid(
-            -torch.bmm(neg_w, h.unsqueeze(-1)).squeeze(-1)
-        ).sum(dim=1)
-
-        return -(pos + neg).mean()
-
-    def _gene_pathway(self, genes, pathways, gene_embeds):
-        h = gene_embeds[genes]
-        w = self.pathway_weights[pathways]
-
-        pos = F.logsigmoid(torch.sum(h * w, dim=1))
-
-        neg_ids = self._sample_pathway_neg(len(genes), h.device)
-        neg_w = self.pathway_weights[neg_ids]
-
-        neg = F.logsigmoid(
-            -torch.bmm(neg_w, h.unsqueeze(-1)).squeeze(-1)
-        ).sum(dim=1)
-
-        return -(pos + neg).mean()
-
-    def _pathway_gene(self, pathways, genes, pathway_embeds):
-        h = pathway_embeds[pathways]
-        w = self.gene_weights[genes]
-
-        pos = F.logsigmoid(torch.sum(h * w, dim=1))
-
-        neg_ids = self._sample_gene_neg(len(pathways), h.device)
-        neg_w = self.gene_weights[neg_ids]
-
-        neg = F.logsigmoid(
-            -torch.bmm(neg_w, h.unsqueeze(-1)).squeeze(-1)
-        ).sum(dim=1)
-
-        return -(pos + neg).mean()
-
-    # --------------------------------------------------
-    #  Unified forward
-    # --------------------------------------------------
-    def forward(
-        self,
-        gene_embeds,
-        pathway_embeds,
-        gene_gene_pairs=None,
-        gene_pathway_pairs=None,
-        pathway_gene_pairs=None,
-        weights=None,
-        return_breakdown=False
-    ):
-        """
-        All *_pairs are tuples of ID tensors
-        """
-
-        if weights is None:
-            weights = {
-                "gene_gene": 1.0,
-                "gene_pathway": 1.0,
-                "pathway_gene": 0.5
-            }
-
-        total_loss = 0.0
-        breakdown = {}
-
-        if gene_gene_pairs is not None:
-            src, ctx = gene_gene_pairs
-            L = self._gene_gene(src, ctx, gene_embeds)
-            total_loss += weights["gene_gene"] * L
-            breakdown["gene_gene"] = L.item()
-
-        if gene_pathway_pairs is not None:
-            g, p = gene_pathway_pairs
-            L = self._gene_pathway(g, p, gene_embeds)
-            total_loss += weights["gene_pathway"] * L
-            breakdown["gene_pathway"] = L.item()
-
-        if pathway_gene_pairs is not None:
-            p, g = pathway_gene_pairs
-            L = self._pathway_gene(p, g, pathway_embeds)
-            total_loss += weights["pathway_gene"] * L
-            breakdown["pathway_gene"] = L.item()
-
-        if return_breakdown:
-            return total_loss, breakdown
-
-        return total_loss
-
-
-
-class PathwayNegativeSamplingLossSimple(nn.Module):
-    def __init__(self, num_genes, embed_dim, num_neg_samples):
-        super().__init__()
-        self.num_neg = num_neg_samples
-        self.weights = nn.Parameter(
-            torch.randn(num_genes, embed_dim) / math.sqrt(embed_dim)
-        )
-
-    def forward(self, heads, head_embeds, tails):
-        """
-        heads: (B,)
-        head_embeds: (B, D)
-        tails: (B,)
-        """
-        B, D = head_embeds.shape
-
-        # positive
-        pos_w = self.weights[tails]                       # (B, D)
-        pos_score = torch.sum(head_embeds * pos_w, dim=1)
-        pos_loss = F.logsigmoid(pos_score)
-
-        # negative
-        neg_tails = torch.randint(
-            0, self.weights.size(0),
-            (B, self.num_neg),
-            device=head_embeds.device
-        )
-        neg_w = self.weights[neg_tails]                   # (B, K, D)
-        neg_score = torch.bmm(
-            neg_w.neg(),
-            head_embeds.unsqueeze(-1)
-        ).squeeze(-1)                                     # (B, K)
-        neg_loss = F.logsigmoid(neg_score).sum(dim=1)
-
-        return -(pos_loss + neg_loss).mean()
+        return {
+            "gg_pos": list(gg_pairs),
+            "gp_pos": list(gp_pairs),
+            "pg_pos": list(pg_pairs),
+            "gg_neg": list(neg_gg),
+            "gp_neg": list(neg_gp),
+            "pg_neg": list(neg_pg)
+        }
 
