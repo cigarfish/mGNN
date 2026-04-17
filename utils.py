@@ -619,8 +619,8 @@ def load_reactome_mux_graph(ppi_file, pathway_gene_file, pathway_rel_file):
     g.levels = precompute_hierarchy_levels(g)
     precompute_gene_relative_depths(g)
     
-    verify_hierarchy_levels(g)
-    print_hierarchy_tree(g)
+    #verify_hierarchy_levels(g)
+    #print_hierarchy_tree(g)
 
     # Return the graph and the gene/pathway ID mappings
     return g, gene2id, pathway2id

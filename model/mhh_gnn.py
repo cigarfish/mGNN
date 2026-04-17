@@ -1193,6 +1193,8 @@ class MHHGNN(nn.Module):
 
         gene_emb = enc_out["gene_emb"]
         pathway_emb = enc_out["pathway_emb"]
+        context_vec = enc_out["context_vec"]
+        auto_loss = enc_out["auto_loss"]
         # Pack embeddings for loss
         embeddings = {
             "gene": gene_emb,
@@ -1203,9 +1205,9 @@ class MHHGNN(nn.Module):
             return enc_out
 
         # Sampling
-        sample_dict = sampler.sample_pos_neg(ctx)
+        sample_dict = sampler.observe_and_sample(ctx)
         # Loss
-        loss = self.loss_fn(embeddings, sample_dict)
+        loss = self.loss_fn(embeddings, sample_dict, context_vec, auto_loss)
         # For now, just return gene embeddings and attention maps
         return loss, enc_out
 
